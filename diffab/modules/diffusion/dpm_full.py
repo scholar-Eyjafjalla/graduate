@@ -4,11 +4,17 @@ import torch.nn.functional as F
 import functools
 from tqdm.auto import tqdm
 
-from diffab.modules.common.geometry import apply_rotation_to_vector, quaternion_1ijk_to_rotation_matrix
+from diffab.modules.common.geometry import apply_rotation_to_vector, quaternion_1ijk_to_rotation_matrix, construct_3d_basis
 from diffab.modules.common.so3 import so3vec_to_rotation, rotation_to_so3vec, random_uniform_so3
-from diffab.modules.encoders.ga import GAEncoder
+from diffab.modules.adapters.dymean_adapter import DiffabToDyMeanAdapter
+from diffab.modules.encoders.ga import GAEncoder, GNNEncoder, EnhancedGNNEncoder, NewGNNEncoder
 from .transition import RotationTransition, PositionTransition, AminoacidCategoricalTransition
-
+from diffab.utils.protein.constants import  (
+    max_num_heavyatoms,
+    BBHeavyAtom,
+    backbone_atom_coordinates_tensor,  # 添加缺失的骨架坐标常量
+    bb_oxygen_coordinate_tensor  # 添加缺失的氧原子坐标常量
+)
 
 def rotation_matrix_cosine_loss(R_pred, R_true):
     """
@@ -31,35 +37,50 @@ def rotation_matrix_cosine_loss(R_pred, R_true):
 
 
 class EpsilonNet(nn.Module):
-
-    def __init__(self, res_feat_dim, pair_feat_dim, num_layers, encoder_opt={}):
+##########################################################
+    def __init__(self, res_feat_dim, num_layers, encoder_opt={}, type_embed_weights=None):
         super().__init__()
+        self.type_embed_weights = type_embed_weights
         self.current_sequence_embedding = nn.Embedding(25, res_feat_dim)  # 22 is padding
-        self.res_feat_mixer = nn.Sequential(
-            nn.Linear(res_feat_dim * 2, res_feat_dim), nn.ReLU(),
+        self.gnn_feat_mixer = nn.Sequential(
+            nn.Linear(128+256, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, res_feat_dim),
         )
-        self.encoder = GAEncoder(res_feat_dim, pair_feat_dim, num_layers, **encoder_opt)
-
+        self.adapter = DiffabToDyMeanAdapter(cfg={
+            'res_feat_dim': res_feat_dim,
+            'atom_type_embed_dim': 32,
+            'atom_type_size': 4
+        })
+        self.encoder = NewGNNEncoder(
+            node_feat_dim=res_feat_dim,
+            hidden_dim=encoder_opt.get('hidden_dim', 256),
+            num_layers=num_layers,
+            **encoder_opt
+        )
+        
+        # self.encoder = GAEncoder(res_feat_dim, pair_feat_dim, num_layers, **encoder_opt)#################
+        # self.encoder = GNNEncoder(res_feat_dim, pair_feat_dim, num_layers, **encoder_opt)
+        # self.encoder = EnhancedGNNEncoder(res_feat_dim, pair_feat_dim, num_layers, **encoder_opt)
         self.eps_crd_net = nn.Sequential(
-            nn.Linear(res_feat_dim+3, res_feat_dim), nn.ReLU(),
+            nn.Linear(256+3, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, 3)
         )
 
         self.eps_rot_net = nn.Sequential(
-            nn.Linear(res_feat_dim+3, res_feat_dim), nn.ReLU(),
+            nn.Linear(256+3, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, 3)
         )
 
         self.eps_seq_net = nn.Sequential(
-            nn.Linear(res_feat_dim+3, res_feat_dim), nn.ReLU(),
+            nn.Linear(256+3, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, res_feat_dim), nn.ReLU(),
             nn.Linear(res_feat_dim, 20), nn.Softmax(dim=-1) 
         )
-
-    def forward(self, v_t, p_t, s_t, res_feat, pair_feat, beta, mask_generate, mask_res):
+    def forward(self, batch, v_t, p_t, s_t, gnn_feat, beta, mask_generate, mask_res):
+    # def forward(self, batch, v_t, p_t, s_t, res_feat, pair_feat, beta, mask_generate, mask_res):
+    # def forward(self, batch):
         """
         Args:
             v_t:    (N, L, 3).
@@ -74,25 +95,83 @@ class EpsilonNet(nn.Module):
             v_next: UPDATED (not epsilon) SO3-vector of orietnations, (N, L, 3).
             eps_pos: (N, L, 3).
         """
-        N, L = mask_res.size()
-        R = so3vec_to_rotation(v_t) # (N, L, 3, 3)
+        # v_t = rotation_to_so3vec(construct_3d_basis(
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.CA],
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.C],
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.N],
+        # ))
+        # p_t = batch['pos_heavyatom'][:, :, BBHeavyAtom.CA]
+        # s_t = batch['aa']
+        # mask_generate = batch['generate_flag']
+        # mask_res = batch['mask_heavyatom'][:, :, BBHeavyAtom.CA]
 
+        N, L = mask_res.size()
+        R_t = so3vec_to_rotation(v_t) # (N, L, 3, 3)
+        pos_CA = p_t  # 扩散后的CA坐标
+        aa_indices = s_t.long()  # [N, L]
+        # 获取每个残基的主链原子相对坐标 [N, L, 3]
+        bb_coords = torch.stack([
+            backbone_atom_coordinates_tensor[i][:3].clone().detach().to(device=mask_res.device)  # N/CA/C坐标
+            for i in aa_indices.view(-1)
+        ], dim=0).view(N, L, 3, 3)
+        
+        # 获取氧原子动态坐标 [N, L, 3]
+        o_coords = torch.stack([
+            bb_oxygen_coordinate_tensor[i].clone().detach().to(device=mask_res.device)
+            for i in aa_indices.view(-1)
+        ], dim=0).view(N, L, 3)
+
+        pos_N = apply_rotation_to_vector(R_t, bb_coords[..., 0, :]) + pos_CA
+        pos_C = apply_rotation_to_vector(R_t, bb_coords[..., 2, :]) + pos_CA
+        pos_O = apply_rotation_to_vector(R_t, o_coords) + pos_CA
+    
+        # 构造扩散后的原子坐标 [B, L, 4, 3]
+        pos_atoms = torch.stack([pos_N, pos_CA, pos_C, pos_O], dim=2)
+        batch_t = {
+            'pos_heavyatom': pos_atoms,  # 扩散后的原子坐标
+            'aa': s_t,                  # 扩散后的氨基酸类型
+            
+            # 静态特征（复用原始数据）
+            'res_nb': batch['res_nb'],          # 残基序号不变
+            'chain_nb': batch['chain_nb'],      # 链编号不变
+            'fragment_type': batch['fragment_type'],  # 片段类型不变
+            'mask_heavyatom': batch['mask_heavyatom'][..., [0,1,2,3]] 
+        }
         # s_t = s_t.clamp(min=0, max=19)  # TODO: clamping is good but ugly.
-        res_feat = self.res_feat_mixer(torch.cat([res_feat, self.current_sequence_embedding(s_t)], dim=-1)) # [Important] Incorporate sequence at the current step.
-        res_feat = self.encoder(R, p_t, res_feat, pair_feat, mask_res)
+        
+        dymean_data = self.adapter(batch_t)
+        B, L = dymean_data['X'].shape[:2]
+        X_t = dymean_data['X'].view(B*L, 4, 3)
+        H_t = dymean_data['H'].view(B*L, -1)
+        A_t = dymean_data['A'].view(B*L, 4)
+        AP_t = dymean_data['AP'].view(B*L, 4)
+        segment_ids = dymean_data['segment_ids'].view(B*L)
+        batch_id = dymean_data['batch_id'].view(B*L)
+        # print("[DEBUG] gnn_feat.shape:", gnn_feat.shape)
+        # print("[DEBUG] H_t.shape:", H_t.shape)
+        # fused_feat = torch.cat([
+        #     gnn_feat.view(B*L, -1),  # 静态特征 [B*L, 128]
+        #     H_t                         # 动态特征 [B*L, 256]
+        # ], dim=-1)  # [B*L, 384]
+        # print("[DEBUG] gnn_feat.view(B*L, -1).shape:", gnn_feat.view(B*L, -1).shape)
+        # print("[DEBUG] self.current_sequence_embedding(s_t).shape:", self.current_sequence_embedding(s_t).shape)
+        # fused_feat = self.gnn_feat_mixer(torch.cat([gnn_feat.view(B*L, -1), self.current_sequence_embedding(s_t).view(B*L, -1)], dim=-1))
+
+        gnn_feat = self.encoder(X_t, H_t, A_t, AP_t, segment_ids, batch_id, B, L)
+        # res_feat = self.encoder(R, p_t, res_feat, pair_feat, mask_res)
 
         t_embed = torch.stack([beta, torch.sin(beta), torch.cos(beta)], dim=-1)[:, None, :].expand(N, L, 3)
-        in_feat = torch.cat([res_feat, t_embed], dim=-1)
+        in_feat = torch.cat([gnn_feat, t_embed], dim=-1)
 
         # Position changes
         eps_crd = self.eps_crd_net(in_feat)    # (N, L, 3)
-        eps_pos = apply_rotation_to_vector(R, eps_crd)  # (N, L, 3)
+        eps_pos = apply_rotation_to_vector(R_t, eps_crd)  # (N, L, 3)
         eps_pos = torch.where(mask_generate[:, :, None].expand_as(eps_pos), eps_pos, torch.zeros_like(eps_pos))
 
         # New orientation
         eps_rot = self.eps_rot_net(in_feat)    # (N, L, 3)
         U = quaternion_1ijk_to_rotation_matrix(eps_rot) # (N, L, 3, 3)
-        R_next = R @ U
+        R_next = R_t @ U
         v_next = rotation_to_so3vec(R_next)     # (N, L, 3)
         v_next = torch.where(mask_generate[:, :, None].expand_as(v_next), v_next, v_t)
 
@@ -106,8 +185,8 @@ class FullDPM(nn.Module):
 
     def __init__(
         self, 
-        res_feat_dim, 
-        pair_feat_dim, 
+        gnn_feat_dim, 
+        # pair_feat_dim, 
         num_steps, 
         eps_net_opt={}, 
         trans_rot_opt={}, 
@@ -115,9 +194,11 @@ class FullDPM(nn.Module):
         trans_seq_opt={},
         position_mean=[0.0, 0.0, 0.0],
         position_scale=[10.0],
+        type_embed_weights=None,
     ):
         super().__init__()
-        self.eps_net = EpsilonNet(res_feat_dim, pair_feat_dim, **eps_net_opt)
+        self.eps_net = EpsilonNet(gnn_feat_dim, type_embed_weights=type_embed_weights, **eps_net_opt)
+        # self.eps_net = EpsilonNet(res_feat_dim, pair_feat_dim,type_embed_weights=type_embed_weights, **eps_net_opt)
         self.num_steps = num_steps
         self.trans_rot = RotationTransition(num_steps, **trans_rot_opt)
         self.trans_pos = PositionTransition(num_steps, **trans_pos_opt)
@@ -126,6 +207,7 @@ class FullDPM(nn.Module):
         self.register_buffer('position_mean', torch.FloatTensor(position_mean).view(1, 1, -1))
         self.register_buffer('position_scale', torch.FloatTensor(position_scale).view(1, 1, -1))
         self.register_buffer('_dummy', torch.empty([0, ]))
+        
 
     def _normalize_position(self, p):
         p_norm = (p - self.position_mean) / self.position_scale
@@ -135,8 +217,20 @@ class FullDPM(nn.Module):
         p = p_norm * self.position_scale + self.position_mean
         return p
 
-    def forward(self, v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res, denoise_structure, denoise_sequence, t=None):
-        N, L = res_feat.shape[:2]
+    #def forward(self, v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res, denoise_structure, denoise_sequence, t=None):
+    def forward(self, batch, gnn_feat, denoise_structure, denoise_sequence, t=None):
+        # 从batch中提取原始数据
+        v_0 = rotation_to_so3vec(construct_3d_basis(
+            batch['pos_heavyatom'][:, :, BBHeavyAtom.CA],
+            batch['pos_heavyatom'][:, :, BBHeavyAtom.C],
+            batch['pos_heavyatom'][:, :, BBHeavyAtom.N],
+        ))
+        p_0 = self._normalize_position(batch['pos_heavyatom'][:, :, BBHeavyAtom.CA])
+        s_0 = batch['aa']
+        mask_generate = batch['generate_flag']
+        mask_res = batch['mask_heavyatom'][:, :, BBHeavyAtom.CA]
+
+        N, L = gnn_feat.shape[:2]
         if t == None:
             t = torch.randint(0, self.num_steps, (N,), dtype=torch.long, device=self._dummy.device)
         p_0 = self._normalize_position(p_0)
@@ -160,8 +254,11 @@ class FullDPM(nn.Module):
             s_noisy = s_0.clone()
 
         beta = self.trans_pos.var_sched.betas[t]
+        # v_pred, R_pred, eps_p_pred, c_denoised = self.eps_net(
+        #     batch, v_noisy, p_noisy, s_noisy, res_feat, pair_feat, beta, mask_generate, mask_res
+        # )   # (N, L, 3), (N, L, 3, 3), (N, L, 3), (N, L, 20), (N, L)
         v_pred, R_pred, eps_p_pred, c_denoised = self.eps_net(
-            v_noisy, p_noisy, s_noisy, res_feat, pair_feat, beta, mask_generate, mask_res
+            batch, v_noisy, p_noisy, s_noisy, gnn_feat, beta, mask_generate, mask_res
         )   # (N, L, 3), (N, L, 3, 3), (N, L, 3), (N, L, 20), (N, L)
 
         loss_dict = {}
@@ -199,12 +296,23 @@ class FullDPM(nn.Module):
         sample_structure=True, sample_sequence=True,
         pbar=False,
     ):
+    # def sample(self, batch, res_feat, pair_feat, sample_structure=True, sample_sequence=True,pbar=False):
         """
         Args:
             v:  Orientations of contextual residues, (N, L, 3).
             p:  Positions of contextual residues, (N, L, 3).
             s:  Sequence of contextual residues, (N, L).
         """
+        # v = rotation_to_so3vec(construct_3d_basis(
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.CA],
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.C],
+        #     batch['pos_heavyatom'][:, :, BBHeavyAtom.N],
+        # ))
+        # p = self._normalize_position(batch['pos_heavyatom'][:, :, BBHeavyAtom.CA])
+        # s = batch['aa']
+        # mask_generate = batch['generate_flag']
+        # mask_res = batch['mask_heavyatom'][:, :, BBHeavyAtom.CA]
+
         N, L = v.shape[:2]
         p = self._normalize_position(p)
 
