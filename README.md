@@ -1,3 +1,10 @@
+## Acknowledgements
+
+This project builds upon code and ideas from:
+
+- Luo, S., Su, Y., Peng, X., Wang, S., Peng, J., & Ma, J. (2022). *Antigen-Specific Antibody Design and Optimization with Diffusion-Based Generative Models for Protein Structures*. In Advances in Neural Information Processing Systems. [Link](https://openreview.net/forum?id=jSorGn2Tjg)
+
+
 # DiffAb
 
 ![cover-large](./assets/cover-large.png)
